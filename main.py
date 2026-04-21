@@ -32,11 +32,11 @@ def update(deal, fields):
     bx("crm.deal.update", d)
 
 def parse(t):
-    m = re.match(r"(\\d+)-(\\d+)", t)
+    m = re.match(r"(\d+)-(\d+)", t)
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 def extract(log):
-    return list(set(map(int, re.findall(r"\\[(\\d+)\\]", log or ""))))
+    return list(set(map(int, re.findall(r"\[(\d+)\]", log or ""))))
 
 @app.post("/webhook/telegram")
 async def webhook(req: Request):
