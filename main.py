@@ -13,6 +13,10 @@ FIELD_TOTAL_ITEMS = os.getenv("FIELD_TOTAL_ITEMS", "").strip()
 FIELD_READY_LOG = os.getenv("FIELD_READY_LOG", "").strip()
 BITRIX_STAGE_DONE = os.getenv("BITRIX_STAGE_DONE", "").strip()
 
+ALLOWED_STAGES = [
+    x.strip() for x in os.getenv("ALLOWED_STAGES", "").split(",") if x.strip()
+]
+
 USE_MANAGER_WHITELIST = os.getenv("USE_MANAGER_WHITELIST", "false").lower() == "true"
 MANAGERS_CHAT_IDS = {
     x.strip() for x in os.getenv("MANAGERS_CHAT_IDS", "").split(",") if x.strip()
@@ -66,7 +70,7 @@ def validate_manager(chat_id):
     return str(chat_id) in MANAGERS_CHAT_IDS
 
 
-def get_deal_by_title(deal_title):
+def get_deal_by_title_in_allowed_stages(deal_title):
     result = bx(
         "crm.deal.list",
         {
@@ -84,10 +88,24 @@ def get_deal_by_title(deal_title):
     if not result:
         return None
 
-    if len(result) > 1:
-        raise Exception(f"Найдено несколько сделок с названием {deal_title}")
+    filtered = []
+    for deal in result:
+        stage_id = str(deal.get("STAGE_ID", "")).strip()
+        if not ALLOWED_STAGES or stage_id in ALLOWED_STAGES:
+            filtered.append(deal)
 
-    return result[0]
+    if not filtered:
+        raise Exception(
+            f"Сделка {deal_title} найдена, но не находится в разрешённых стадиях."
+        )
+
+    if len(filtered) > 1:
+        stages = ", ".join(sorted({str(x.get('STAGE_ID', '')) for x in filtered}))
+        raise Exception(
+            f"Найдено несколько сделок с названием {deal_title} в разрешённых стадиях: {stages}"
+        )
+
+    return filtered[0]
 
 
 def update_deal(deal_id, fields):
@@ -122,13 +140,13 @@ async def webhook(req: Request):
 
     parsed = parse_command(text)
     if not parsed:
-        tg(chat_id, "Формат: НАЗВАНИЕ_СДЕЛКИ-НОМЕР_ИЗДЕЛИЯ\nПример: 0132-1")
+        tg(chat_id, "Формат: НОМЕР_ЗАКАЗА-НОМЕР_ИЗДЕЛИЯ\nПример: 0132-1")
         return {"ok": True}
 
     deal_title, item_number = parsed
 
     try:
-        deal = get_deal_by_title(deal_title)
+        deal = get_deal_by_title_in_allowed_stages(deal_title)
 
         if not deal:
             tg(chat_id, f"Сделка с названием {deal_title} не найдена.")
