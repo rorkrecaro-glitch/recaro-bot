@@ -13,7 +13,7 @@ BITRIX_WEBHOOK_BASE = os.getenv("BITRIX_WEBHOOK_BASE", "").rstrip("/")
 FIELD_TOTAL_ITEMS = os.getenv("FIELD_TOTAL_ITEMS", "UF_CRM_1603897171608").strip()
 FIELD_READY_LOG = os.getenv("FIELD_READY_LOG", "UF_CRM_1737815245").strip()
 FIELD_DEBT = os.getenv("FIELD_DEBT", "UF_CRM_1607545265860").strip()
-FIELD_DUE_DATE = os.getenv("FIELD_DUE_DATE", "UF_CRM_1602503835429").strip()
+FIELD_DUE_DATE = os.getenv("FIELD_DUE_DATE", "CLOSEDATE").strip()
 
 BITRIX_STAGE_DONE = os.getenv("BITRIX_STAGE_DONE", "EXECUTING").strip()
 
@@ -81,7 +81,6 @@ def bx(method, data):
 def parse_command(text):
     text = (text or "").strip()
 
-    # Полный формат: 0001-1
     m = re.fullmatch(r"(.+)-(\d+)", text)
     if m:
         return {
@@ -90,7 +89,6 @@ def parse_command(text):
             "mode": "full",
         }
 
-    # Только номер заказа: 0001
     if re.fullmatch(r"\d+", text):
         return {
             "deal_title": text,
@@ -123,10 +121,25 @@ def build_ready_lines(items):
     return [f"[{i}] изделие в заказе готово." for i in sorted(items)]
 
 
-def format_money(value):
+def clean_money_value(value):
     value = normalize_value(value)
 
     if value in (None, "", "0", 0, "0.00"):
+        return "0"
+
+    value = str(value).strip()
+
+    # Битрикс денежные поля отдаёт так: 4500|RUB
+    if "|" in value:
+        value = value.split("|")[0]
+
+    return value.strip()
+
+
+def format_money(value):
+    value = clean_money_value(value)
+
+    if value in (None, "", "0", "0.00"):
         return "0"
 
     try:
@@ -141,9 +154,9 @@ def format_money(value):
 
 
 def parse_money(value):
-    value = normalize_value(value)
+    value = clean_money_value(value)
 
-    if value in (None, "", "0", 0, "0.00"):
+    if value in (None, "", "0", "0.00"):
         return 0.0
 
     try:
@@ -276,7 +289,11 @@ def send_multiple_found(chat_id):
 
 def send_deal_info(chat_id, deal_title, deal):
     total_raw = deal.get(FIELD_TOTAL_ITEMS)
-    total_items = int(float(str(total_raw).replace(",", "."))) if total_raw not in (None, "", "0", 0) else 0
+
+    if total_raw not in (None, "", "0", 0):
+        total_items = int(float(str(total_raw).replace(",", ".")))
+    else:
+        total_items = 0
 
     ready_items = extract_ready_items(deal.get(FIELD_READY_LOG))
     ready_count = len(ready_items)
@@ -285,7 +302,9 @@ def send_deal_info(chat_id, deal_title, deal):
     stage = stage_name(deal.get("STAGE_ID"))
     date_create = format_date(deal.get("DATE_CREATE"))
     due_date = format_date(deal.get(FIELD_DUE_DATE))
-    debt = parse_money(deal.get(FIELD_DEBT))
+
+    debt_value = deal.get(FIELD_DEBT)
+    debt = parse_money(debt_value)
 
     if total_items:
         ready_line = f"{ready_count} из {total_items}"
@@ -303,7 +322,7 @@ def send_deal_info(chat_id, deal_title, deal):
     )
 
     if debt > 0:
-        message += f"\n\nВнимание! По заказу имеется доплата в размере {format_money(deal.get(FIELD_DEBT))} рублей."
+        message += f"\n\nВнимание! По заказу имеется доплата в размере {format_money(debt_value)} рублей."
     else:
         message += "\n\nОстаток по заказу: 0 рублей."
 
