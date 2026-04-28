@@ -190,7 +190,7 @@ def debt_warning(value):
     debt = parse_money(value)
 
     if debt > 0:
-        return f"Внимание! По заказу имеется доплата в размере {format_money(value)} рублей."
+        return f"‼️ По заказу имеется доплата в размере {format_money(value)} рублей."
 
     return ""
 
