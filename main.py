@@ -18,10 +18,12 @@ FIELD_DUE_DATE = os.getenv("FIELD_DUE_DATE", "CLOSEDATE").strip()
 BITRIX_STAGE_DONE = os.getenv("BITRIX_STAGE_DONE", "EXECUTING").strip()
 
 ALLOWED_STAGES = [
-    x.strip() for x in os.getenv(
+    x.strip()
+    for x in os.getenv(
         "ALLOWED_STAGES",
         "PREPAYMENT_INVOICE,UC_XUA0KH,UC_CMK8UN,UC_V2F091,UC_UL1L0V,NEW"
-    ).split(",") if x.strip()
+    ).split(",")
+    if x.strip()
 ]
 
 USE_MANAGER_WHITELIST = os.getenv("USE_MANAGER_WHITELIST", "false").lower() == "true"
@@ -73,14 +75,17 @@ def bx(method, data):
         timeout=30,
     )
     j = r.json()
+
     if "result" not in j:
         raise Exception(f"Bitrix error: {j}")
+
     return j["result"]
 
 
 def parse_command(text):
     text = (text or "").strip()
 
+    # Формат: 0001-1
     m = re.fullmatch(r"(.+)-(\d+)", text)
     if m:
         return {
@@ -89,6 +94,7 @@ def parse_command(text):
             "mode": "full",
         }
 
+    # Формат: 0001
     if re.fullmatch(r"\d+", text):
         return {
             "deal_title": text,
@@ -190,7 +196,7 @@ def debt_warning(value):
     debt = parse_money(value)
 
     if debt > 0:
-        return f"‼️ По заказу имеется доплата в размере {format_money(value)} рублей."
+        return f"‼️По заказу имеется доплата в размере {format_money(value)} рублей."
 
     return ""
 
@@ -244,6 +250,7 @@ def get_deal_by_title_in_allowed_stages(deal_title):
     filtered = []
     for deal in result:
         stage_id = str(deal.get("STAGE_ID", "")).strip()
+
         if not ALLOWED_STAGES or stage_id in ALLOWED_STAGES:
             filtered.append(deal)
 
@@ -322,9 +329,7 @@ def send_deal_info(chat_id, deal_title, deal):
     )
 
     if debt > 0:
-        message += f"\n\n‼️Внимание! По заказу имеется доплата в размере {format_money(debt_value)} рублей."
-    else:
-        message += "\n\nОстаток по заказу: 0 рублей."
+        message += f"\n\n‼️По заказу имеется доплата в размере {format_money(debt_value)} рублей."
 
     tg(chat_id, message)
 
@@ -337,6 +342,7 @@ def root():
 @app.post("/webhook/telegram")
 async def webhook(req: Request):
     secret = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+
     if TELEGRAM_SECRET_TOKEN and secret != TELEGRAM_SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid secret token")
 
