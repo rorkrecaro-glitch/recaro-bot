@@ -322,7 +322,7 @@ def send_deal_info(chat_id, deal_title, deal):
     )
 
     if debt > 0:
-        message += f"\n\nВнимание! По заказу имеется доплата в размере {format_money(debt_value)} рублей."
+        message += f"\n\n‼️Внимание! По заказу имеется доплата в размере {format_money(debt_value)} рублей."
     else:
         message += "\n\nОстаток по заказу: 0 рублей."
 
