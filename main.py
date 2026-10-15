@@ -1,10 +1,38 @@
 import os
 import re
 import requests
-from datetime import datetime
+import sqlite3
+import secrets
+import logging
+import asyncio
+from contextlib import contextmanager, asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, HTTPException
 
-app = FastAPI()
+MSK = timezone(timedelta(hours=3))
+REPORT_HOUR = 20
+REPORT_MINUTE = 30
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # The scheduler lives in the existing Amvera app; no outside scheduler is needed.
+    task = asyncio.create_task(daily_report_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(lifespan=lifespan)
+
+# Pending button actions are stored on Amvera's persistent /data volume.
+READY_ACTIONS_DB = os.getenv("READY_ACTIONS_DB", "/data/ready_actions.sqlite3")
+logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip()
@@ -66,6 +94,362 @@ def tg(chat_id, text):
         json={"chat_id": chat_id, "text": text},
         timeout=20,
     )
+
+
+def telegram_action(method, payload):
+    """Check new Telegram API operations instead of silently ignoring failures."""
+    response = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+        json=payload,
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError("Telegram API did not accept the request")
+    return data.get("result")
+
+
+@contextmanager
+def ready_actions_db():
+    os.makedirs(os.path.dirname(os.path.abspath(READY_ACTIONS_DB)), exist_ok=True)
+    connection = sqlite3.connect(READY_ACTIONS_DB, timeout=10)
+    try:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS ready_actions (
+                token TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER,
+                deal_title TEXT NOT NULL,
+                item_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Upgrade safely if a prior pre-report version of the bot created the DB.
+        cols = {row[1] for row in connection.execute("PRAGMA table_info(ready_actions)")}
+        if "created_at" not in cols:
+            connection.execute("ALTER TABLE ready_actions ADD COLUMN created_at TEXT")
+            connection.execute("UPDATE ready_actions SET created_at = updated_at WHERE created_at IS NULL")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS report_chats (
+                chat_id INTEGER PRIMARY KEY,
+                registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS daily_reports (
+                chat_id INTEGER NOT NULL,
+                report_date TEXT NOT NULL,
+                sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(chat_id, report_date)
+            )
+        """)
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def answer_ready_callback(callback_id, message, alert=False):
+    try:
+        telegram_action("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": message[:200],
+            "show_alert": alert,
+        })
+    except Exception:
+        logger.exception("Could not answer Telegram button callback")
+
+
+def change_ready_message(chat_id, message_id, text):
+    telegram_action("editMessageText", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        # No reply_markup: Telegram removes the buttons after resolution.
+    })
+
+
+def get_ready_action(token):
+    with ready_actions_db() as connection:
+        return connection.execute(
+            "SELECT chat_id, message_id, deal_title, item_number, status "
+            "FROM ready_actions WHERE token = ?", (token,)
+        ).fetchone()
+
+
+def claim_ready_action(token, chat_id, message_id):
+    """At most one worker handles a button press; recover after worker crashes."""
+    with ready_actions_db() as connection:
+        cursor = connection.execute("""
+            UPDATE ready_actions
+               SET status = 'processing', updated_at = CURRENT_TIMESTAMP
+             WHERE token = ? AND chat_id = ? AND message_id = ?
+               AND (status IN ('pending', 'unresolved') OR
+                    (status = 'processing' AND updated_at < datetime('now', '-3 minutes')))
+        """, (token, chat_id, message_id))
+        return cursor.rowcount == 1
+
+
+def finish_ready_action(token, status):
+    with ready_actions_db() as connection:
+        connection.execute(
+            "UPDATE ready_actions SET status = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE token = ? AND status = 'processing'",
+            (status, token),
+        )
+
+
+def completed_item_message(deal_title, item_number):
+    """Read-only resolution if another attempt already finished the whole deal.
+
+    The ordinary command never reopens completed deals. Only a pending button can
+    acknowledge an item *already recorded* in a single completed deal.
+    """
+    candidates = bx("crm.deal.list", {
+        "filter[TITLE]": str(deal_title),
+        "select[]": ["ID", "TITLE", "STAGE_ID", FIELD_TOTAL_ITEMS, FIELD_READY_LOG, FIELD_DEBT],
+    })
+    if len(candidates) != 1:
+        return None
+    deal = candidates[0]
+    if str(deal.get("STAGE_ID", "")).strip() != BITRIX_STAGE_DONE:
+        return None
+    ready_items = extract_ready_items(deal.get(FIELD_READY_LOG))
+    if item_number not in ready_items:
+        return None
+    total_raw = deal.get(FIELD_TOTAL_ITEMS)
+    if total_raw in (None, "", "0", 0):
+        return None
+    total_items = int(float(str(total_raw).replace(",", ".")))
+    result = (
+        f"🟢 По заказу {deal_title} изделие №{item_number} уже отмечено в Битрикс.\n"
+        f"Готово {len(ready_items)} из {total_items}.\n\n"
+        "Сделка находится в стадии «ЗАКАЗ ВЫПОЛНЕН»."
+    )
+    warning = debt_warning(deal.get(FIELD_DEBT))
+    if warning:
+        result += f"\n\n{warning}"
+    return result
+
+
+def retry_ready_item(deal_title, item_number):
+    """Repeat the original validity checks, then write only if needed.
+
+    Return (success, response). On failure no Bitrix fields are modified.
+    """
+    deal = get_deal_by_title_in_allowed_stages(deal_title)
+    if deal is None:
+        return False, "Сделка ещё не найдена в Битрикс. Проверьте, что она создана."
+    if deal == "NOT_IN_ALLOWED_STAGES":
+        completed = completed_item_message(deal_title, item_number)
+        if completed:
+            return True, completed
+        return False, "Сделка найдена, но находится вне рабочих стадий бота."
+    if deal == "MULTIPLE_IN_ALLOWED_STAGES":
+        return False, "В работе несколько сделок с этим номером. Требуется проверка."
+
+    total_raw = deal.get(FIELD_TOTAL_ITEMS)
+    if total_raw in (None, "", "0", 0):
+        return False, "Сначала заполните количество изделий в сделке Битрикс."
+    total_items = int(float(str(total_raw).replace(",", ".")))
+    if item_number < 1 or item_number > total_items:
+        return False, f"Недопустимый номер изделия. В сделке всего {total_items}."
+
+    ready_items = extract_ready_items(deal.get(FIELD_READY_LOG))
+    already_ready = item_number in ready_items
+    if not already_ready:
+        ready_items = sorted(set(ready_items + [item_number]))
+        update_fields = {FIELD_READY_LOG: build_ready_lines(ready_items)}
+        if len(ready_items) == total_items:
+            update_fields["STAGE_ID"] = BITRIX_STAGE_DONE
+        update_deal(int(deal["ID"]), update_fields)
+
+    ready_count = len(ready_items)
+    if already_ready:
+        message = (f"🟢 По заказу {deal_title} изделие №{item_number} "
+                   f"уже было отмечено в Битрикс.\nГотово {ready_count} из {total_items}.")
+    else:
+        message = (f"🔵 В заказе {deal_title} изделие №{item_number} отмечено.\n"
+                   f"Готово {ready_count} из {total_items}.")
+        if ready_count == total_items:
+            message = (f"🟢 По заказу {deal_title} изделие №{item_number} отмечено.\n"
+                       f"Готово {ready_count} из {total_items}.\n\n"
+                       "Сделка переведена в стадию «ЗАКАЗ ВЫПОЛНЕН».")
+            warning = debt_warning(deal.get(FIELD_DEBT))
+            if warning:
+                message += f"\n\n{warning}"
+
+    return True, message
+
+
+def process_ready_callback(callback):
+    callback_id = callback.get("id")
+    payload = callback.get("data") or ""
+    message = callback.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
+
+    if not callback_id or not payload.startswith(("ready_retry:", "ready_cancel:")):
+        return
+    if not chat_id or message_id is None or not validate_manager(chat_id):
+        answer_ready_callback(callback_id, "Эта кнопка недоступна.", True)
+        return
+
+    token = payload.split(":", 1)[1]
+    try:
+        action = get_ready_action(token)
+        if not action or str(action[0]) != str(chat_id) or action[1] != message_id:
+            answer_ready_callback(callback_id, "Запрос не найден или устарел.", True)
+            return
+        if action[4] in ("done", "cancelled"):
+            answer_ready_callback(callback_id, "Этот запрос уже закрыт.")
+            return
+        if not claim_ready_action(token, chat_id, message_id):
+            answer_ready_callback(callback_id, "Запрос уже обрабатывается. Попробуйте чуть позже.")
+            return
+    except Exception:
+        logger.exception("Could not load ready callback")
+        answer_ready_callback(callback_id, "Временная ошибка. Попробуйте повторно.", True)
+        return
+
+    deal_title, item_number = action[2], action[3]
+    try:
+        if payload.startswith("ready_cancel:"):
+            user = callback.get("from") or {}
+            user_name = ("@" + user["username"]) if user.get("username") else (user.get("first_name") or "Сотрудник")
+            change_ready_message(
+                chat_id, message_id,
+                f"⚪ Заказ {deal_title}, изделие №{item_number}.\n"
+                f"Запрос отменён – ошибка при вводе.\nОтменил: {user_name}",
+            )
+            finish_ready_action(token, "cancelled")
+            answer_ready_callback(callback_id, "Запрос отменён.")
+            return
+
+        success, result_message = retry_ready_item(deal_title, item_number)
+        if not success:
+            finish_ready_action(token, "unresolved")
+            answer_ready_callback(callback_id, result_message, True)
+            return
+
+        change_ready_message(chat_id, message_id, result_message)
+        finish_ready_action(token, "done")
+        answer_ready_callback(callback_id, "Готовность проверена и подтверждена.")
+    except Exception:
+        logger.exception("Could not handle ready callback")
+        try:
+            finish_ready_action(token, "unresolved")
+        except Exception:
+            logger.exception("Could not release ready callback lock")
+        answer_ready_callback(callback_id, "Ошибка проверки. Повторите попытку позднее.", True)
+
+
+
+
+def daily_report_data(chat_id, report_date):
+    """Count all requests since the previous scheduled report.
+
+    Use the 20:30–20:30 Moscow window so incidents after 20:30 aren't lost.
+    """
+    end_msk = datetime.combine(report_date, datetime.min.time(), tzinfo=MSK).replace(
+        hour=REPORT_HOUR, minute=REPORT_MINUTE,
+    )
+    start_utc = (end_msk - timedelta(days=1)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_utc = end_msk.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with ready_actions_db() as connection:
+        rows = connection.execute("""
+            SELECT deal_title, item_number, status
+              FROM ready_actions
+             WHERE chat_id = ? AND message_id IS NOT NULL
+               AND created_at >= ? AND created_at < ?
+             ORDER BY created_at, rowid
+        """, (chat_id, start_utc, end_utc)).fetchall()
+    return rows
+
+
+def format_daily_report(chat_id, report_date):
+    """A report counts requests, not unique deal numbers."""
+    rows = daily_report_data(chat_id, report_date)
+    completed = [row for row in rows if row[2] == "done"]
+    cancelled = [row for row in rows if row[2] == "cancelled"]
+    unresolved = [row for row in rows if row[2] in ("unresolved", "processing")]
+    untouched = [row for row in rows if row[2] == "pending"]
+
+    message = (
+        f"📊 Отчёт на {report_date.strftime('%d.%m.%Y')} – 20:30 МСК\n"
+        "Период: последние 24 часа\n\n"
+        f"Всего запросов без найденной сделки: {len(rows)}\n"
+        f"🟢 Решено: {len(completed) + len(cancelled)} "
+        f"(изделие отмечено: {len(completed)}, ошибка ввода: {len(cancelled)})\n"
+        f"🟡 Не решено: {len(unresolved)}\n"
+        f"🔴 Без реакции: {len(untouched)}"
+    )
+    for heading, cases in (("🔴 Без реакции", untouched), ("🟡 Не решено", unresolved)):
+        if not cases:
+            continue
+        message += f"\n\n{heading}:"
+        displayed = 0
+        for deal_title, item_number, _ in cases:
+            line = f"\n• {deal_title}-{item_number}"
+            # Telegram sendMessage has a 4096-character limit.
+            if len(message) + len(line) + 75 > 3900:
+                break
+            message += line
+            displayed += 1
+        if displayed < len(cases):
+            message += f"\n… и ещё {len(cases) - displayed} запросов"
+    return message
+
+
+def send_due_reports(now_msk=None):
+    """Send each source chat at most one daily report, including a zero report.
+
+    On restart after 20:30, it can catch up before Moscow midnight.
+    Requires the one Amvera replica already used by this bot.
+    """
+    now_msk = now_msk or datetime.now(MSK)
+    if (now_msk.hour, now_msk.minute) < (REPORT_HOUR, REPORT_MINUTE):
+        return
+    day = now_msk.date()
+    day_s = day.isoformat()
+    with ready_actions_db() as connection:
+        chats = [row[0] for row in connection.execute("SELECT chat_id FROM report_chats")]
+    for chat_id in chats:
+        try:
+            with ready_actions_db() as connection:
+                done = connection.execute(
+                    "SELECT 1 FROM daily_reports WHERE chat_id = ? AND report_date = ?",
+                    (chat_id, day_s),
+                ).fetchone()
+            if done:
+                continue
+            telegram_action("sendMessage", {
+                "chat_id": chat_id,
+                "text": format_daily_report(chat_id, day),
+            })
+            with ready_actions_db() as connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO daily_reports (chat_id, report_date) VALUES (?, ?)",
+                    (chat_id, day_s),
+                )
+        except Exception:
+            logger.exception("Could not send daily report for chat %s", chat_id)
+
+
+async def daily_report_loop():
+    # Run a blocking Telegram request on a worker thread, not the ASGI event loop.
+    while True:
+        try:
+            await asyncio.to_thread(send_due_reports)
+        except Exception:
+            logger.exception("Daily report scheduler failed")
+        await asyncio.sleep(10)
 
 
 def bx(method, data):
@@ -276,14 +660,52 @@ def update_deal(deal_id, fields):
     bx("crm.deal.update", payload)
 
 
-def send_not_found(chat_id, deal_title):
-    tg(
-        chat_id,
-        f"🔴 Не удалось определить заказ {deal_title} среди сделок, которые сейчас находятся в работе.\n\n"
-        "Проверьте, пожалуйста, правильно ли указан номер заказа.\n"
-        "Также возможно, что в работе одновременно находится несколько сделок с одинаковым номером.\n\n"
-        "Если потребуется скорректировать сделку в Битрикс, пожалуйста, обратитесь к Руководителю отдела продаж @pretty_jam1"
+def send_not_found(chat_id, deal_title, item_number=None):
+    # For information-only requests, keep the old message unchanged.
+    if item_number is None:
+        tg(
+            chat_id,
+            f"🔴 Не удалось определить заказ {deal_title} среди сделок, которые сейчас находятся в работе.\n\n"
+            "Проверьте, пожалуйста, правильно ли указан номер заказа.\n"
+            "Также возможно, что в работе одновременно находится несколько сделок с одинаковым номером.\n\n"
+            "Если потребуется скорректировать сделку в Битрикс, пожалуйста, обратитесь к Руководителю отдела продаж @pretty_jam1"
+        )
+        return
+
+    content = (
+        f"🔴 Заказ {deal_title}, изделие №{item_number} не найдено среди сделок в работе.\n\n"
+        "Проверьте номер заказа. Возможно, сделка ещё не внесена в Битрикс "
+        "или находится вне рабочих стадий.\n\n"
+        "Ответственный: @pretty_jam1"
     )
+    token = secrets.token_hex(12)
+    try:
+        with ready_actions_db() as connection:
+            connection.execute(
+                "INSERT INTO ready_actions (token, chat_id, deal_title, item_number) "
+                "VALUES (?, ?, ?, ?)", (token, chat_id, deal_title, item_number),
+            )
+        message = telegram_action("sendMessage", {
+            "chat_id": chat_id,
+            "text": content,
+            "reply_markup": {"inline_keyboard": [
+                [{"text": "🔄 Проверить повторно", "callback_data": f"ready_retry:{token}"}],
+                [{"text": "✖️ Ошибка при вводе", "callback_data": f"ready_cancel:{token}"}],
+            ]},
+        })
+        with ready_actions_db() as connection:
+            connection.execute(
+                "UPDATE ready_actions SET message_id = ? WHERE token = ?",
+                (message["message_id"], token),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO report_chats (chat_id) VALUES (?)",
+                (chat_id,),
+            )
+    except Exception:
+        # If new storage/keyboard fails, preserve the original bot response.
+        logger.exception("Could not send message with ready buttons")
+        tg(chat_id, content)
 
 
 def send_multiple_found(chat_id):
@@ -347,6 +769,10 @@ async def webhook(req: Request):
         raise HTTPException(status_code=403, detail="Invalid secret token")
 
     data = await req.json()
+    if data.get("callback_query"):
+        process_ready_callback(data["callback_query"])
+        return {"ok": True}
+
     msg = data.get("message") or data.get("edited_message") or {}
     chat_id = msg.get("chat", {}).get("id")
     text = (msg.get("text") or "").strip()
@@ -375,7 +801,7 @@ async def webhook(req: Request):
         deal = get_deal_by_title_in_allowed_stages(deal_title)
 
         if deal is None or deal == "NOT_IN_ALLOWED_STAGES":
-            send_not_found(chat_id, deal_title)
+            send_not_found(chat_id, deal_title, parsed["item_number"])
             return {"ok": True}
 
         if deal == "MULTIPLE_IN_ALLOWED_STAGES":
