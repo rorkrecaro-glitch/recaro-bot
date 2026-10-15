@@ -146,6 +146,14 @@ def ready_actions_db():
                 PRIMARY KEY(chat_id, report_date)
             )
         """)
+        # Telegram can deliver the same update more than once. Keep IDs across
+        # process restarts on Amvera's persistent /data mount.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS processed_telegram_updates (
+                update_id INTEGER PRIMARY KEY,
+                received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         yield connection
         connection.commit()
     except Exception:
@@ -153,6 +161,31 @@ def ready_actions_db():
         raise
     finally:
         connection.close()
+
+
+def claim_telegram_update(data):
+    """Return False for duplicate deliveries of the same Telegram update_id.
+
+    The atomic unique constraint works across simultaneous webhook requests and
+    survives a restart. A DB error is raised so Telegram can retry the request.
+    """
+    update_id = data.get("update_id")
+    if not isinstance(update_id, int):
+        # Facilitates internal calls/tests without Telegram's transport wrapper.
+        return True
+    with ready_actions_db() as connection:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO processed_telegram_updates (update_id) VALUES (?)",
+            (update_id,),
+        )
+        if cursor.rowcount:
+            # Retain 30 days of IDs; more than enough for Telegram retransmits.
+            connection.execute(
+                "DELETE FROM processed_telegram_updates "
+                "WHERE received_at < datetime('now', '-30 days')"
+            )
+            return True
+        return False
 
 
 def register_report_chat(chat_id):
@@ -816,6 +849,13 @@ def handle_ready_message(data):
         deal = get_deal_by_title_in_allowed_stages(deal_title)
 
         if deal is None or deal == "NOT_IN_ALLOWED_STAGES":
+            # A newly completed deal is not in ALLOWED_STAGES. A delayed or
+            # distinct repeat command must not create a false missing-deal case.
+            if deal == "NOT_IN_ALLOWED_STAGES" and parsed["mode"] == "full":
+                completed = completed_item_message(deal_title, parsed["item_number"])
+                if completed:
+                    tg(chat_id, completed)
+                    return {"ok": True}
             send_not_found(chat_id, deal_title, parsed["item_number"])
             return {"ok": True}
 
@@ -914,16 +954,20 @@ async def webhook(req: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=403, detail="Invalid secret token")
 
     data = await req.json()
-    if data.get("callback_query"):
-        callback = data["callback_query"]
-        # Telegram requires callback acknowledgements promptly, regardless of
-        # Bitrix response time. The slow work happens after the webhook's 200.
-        callback_id = callback.get("id")
-        if callback_id:
-            await asyncio.to_thread(answer_ready_callback, callback_id, "Запрос принят")
-        background_tasks.add_task(process_ready_callback, callback)
+    # Claim before scheduling, so a concurrent Telegram retry is silently
+    # acknowledged without marking the item twice or sending false alerts.
+    if not claim_telegram_update(data):
         return {"ok": True}
 
-    # Bitrix REST uses synchronous requests; run it in a worker so even a
-    # 30-second Bitrix timeout cannot block the next Telegram button tap.
-    return await asyncio.to_thread(handle_ready_message, data)
+    if data.get("callback_query"):
+        callback = data["callback_query"]
+        callback_id = callback.get("id")
+        if callback_id:
+            background_tasks.add_task(answer_ready_callback, callback_id, "Запрос принят")
+        background_tasks.add_task(process_ready_callback, callback)
+    else:
+        # Telegram gets HTTP 200 immediately instead of waiting 30 seconds for
+        # Bitrix REST and retrying the same command while the deal is closing.
+        # Starlette runs this synchronous task off the ASGI event loop.
+        background_tasks.add_task(handle_ready_message, data)
+    return {"ok": True}
