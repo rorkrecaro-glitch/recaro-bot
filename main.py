@@ -155,6 +155,19 @@ def ready_actions_db():
         connection.close()
 
 
+def register_report_chat(chat_id):
+    """Remember chats using the bot, including days without missing deals."""
+    try:
+        with ready_actions_db() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO report_chats (chat_id) VALUES (?)",
+                (chat_id,),
+            )
+    except Exception:
+        # Reporting must never stop the existing ready-item workflow.
+        logger.exception("Could not register report chat %s", chat_id)
+
+
 def answer_ready_callback(callback_id, message, alert=False):
     try:
         telegram_action("answerCallbackQuery", {
@@ -795,6 +808,8 @@ async def webhook(req: Request):
         )
         return {"ok": True}
 
+    # Register a report destination from every valid command, not only errors.
+    register_report_chat(chat_id)
     deal_title = parsed["deal_title"]
 
     try:
