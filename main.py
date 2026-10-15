@@ -7,7 +7,7 @@ import logging
 import asyncio
 from contextlib import contextmanager, asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 
 MSK = timezone(timedelta(hours=3))
 REPORT_HOUR = 20
@@ -179,13 +179,16 @@ def answer_ready_callback(callback_id, message, alert=False):
         logger.exception("Could not answer Telegram button callback")
 
 
-def change_ready_message(chat_id, message_id, text):
-    telegram_action("editMessageText", {
+def change_ready_message(chat_id, message_id, text, reply_markup=None):
+    payload = {
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text,
-        # No reply_markup: Telegram removes the buttons after resolution.
-    })
+    }
+    # Keep action buttons for unresolved checks; omit the keyboard for closed requests.
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    telegram_action("editMessageText", payload)
 
 
 def get_ready_action(token):
@@ -311,24 +314,19 @@ def process_ready_callback(callback):
     if not callback_id or not payload.startswith(("ready_retry:", "ready_cancel:")):
         return
     if not chat_id or message_id is None or not validate_manager(chat_id):
-        answer_ready_callback(callback_id, "Эта кнопка недоступна.", True)
         return
 
     token = payload.split(":", 1)[1]
     try:
         action = get_ready_action(token)
         if not action or str(action[0]) != str(chat_id) or action[1] != message_id:
-            answer_ready_callback(callback_id, "Запрос не найден или устарел.", True)
             return
         if action[4] in ("done", "cancelled"):
-            answer_ready_callback(callback_id, "Этот запрос уже закрыт.")
             return
         if not claim_ready_action(token, chat_id, message_id):
-            answer_ready_callback(callback_id, "Запрос уже обрабатывается. Попробуйте чуть позже.")
             return
     except Exception:
         logger.exception("Could not load ready callback")
-        answer_ready_callback(callback_id, "Временная ошибка. Попробуйте повторно.", True)
         return
 
     deal_title, item_number = action[2], action[3]
@@ -342,25 +340,37 @@ def process_ready_callback(callback):
                 f"Запрос отменён – ошибка при вводе.\nОтменил: {user_name}",
             )
             finish_ready_action(token, "cancelled")
-            answer_ready_callback(callback_id, "Запрос отменён.")
             return
 
         success, result_message = retry_ready_item(deal_title, item_number)
         if not success:
+            # Clearly show that a colleague has checked the request, but the
+            # item is still not marked in Bitrix. Preserve both action buttons.
+            unresolved_text = (
+                f"🟡 Заказ {deal_title}, изделие №{item_number}.\n"
+                f"Повторная проверка: {result_message}\n\n"
+                "Изделие не отмечено. Требуется решение сотрудника.\n"
+                "Ответственный: @pretty_jam1"
+            )
+            keyboard = {"inline_keyboard": [
+                [{"text": "🔄 Проверить повторно", "callback_data": f"ready_retry:{token}"}],
+                [{"text": "✖️ Ошибка при вводе", "callback_data": f"ready_cancel:{token}"}],
+            ]}
+            # Editing an unchanged message returns 400 in Telegram. Repeated
+            # attempts still count as unresolved without producing an error.
+            if message.get("text") != unresolved_text:
+                change_ready_message(chat_id, message_id, unresolved_text, reply_markup=keyboard)
             finish_ready_action(token, "unresolved")
-            answer_ready_callback(callback_id, result_message, True)
             return
 
         change_ready_message(chat_id, message_id, result_message)
         finish_ready_action(token, "done")
-        answer_ready_callback(callback_id, "Готовность проверена и подтверждена.")
     except Exception:
         logger.exception("Could not handle ready callback")
         try:
             finish_ready_action(token, "unresolved")
         except Exception:
             logger.exception("Could not release ready callback lock")
-        answer_ready_callback(callback_id, "Ошибка проверки. Повторите попытку позднее.", True)
 
 
 
@@ -774,18 +784,8 @@ def root():
     return {"ok": True, "service": "telegram-bitrix-ready-bot"}
 
 
-@app.post("/webhook/telegram")
-async def webhook(req: Request):
-    secret = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-
-    if TELEGRAM_SECRET_TOKEN and secret != TELEGRAM_SECRET_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid secret token")
-
-    data = await req.json()
-    if data.get("callback_query"):
-        process_ready_callback(data["callback_query"])
-        return {"ok": True}
-
+def handle_ready_message(data):
+    """Existing message handling, run off the ASGI event loop."""
     msg = data.get("message") or data.get("edited_message") or {}
     chat_id = msg.get("chat", {}).get("id")
     text = (msg.get("text") or "").strip()
@@ -904,3 +904,26 @@ async def webhook(req: Request):
         tg(chat_id, f"❌ Ошибка: {e}")
 
     return {"ok": True}
+
+
+@app.post("/webhook/telegram")
+async def webhook(req: Request, background_tasks: BackgroundTasks):
+    secret = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+
+    if TELEGRAM_SECRET_TOKEN and secret != TELEGRAM_SECRET_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid secret token")
+
+    data = await req.json()
+    if data.get("callback_query"):
+        callback = data["callback_query"]
+        # Telegram requires callback acknowledgements promptly, regardless of
+        # Bitrix response time. The slow work happens after the webhook's 200.
+        callback_id = callback.get("id")
+        if callback_id:
+            await asyncio.to_thread(answer_ready_callback, callback_id, "Запрос принят")
+        background_tasks.add_task(process_ready_callback, callback)
+        return {"ok": True}
+
+    # Bitrix REST uses synchronous requests; run it in a worker so even a
+    # 30-second Bitrix timeout cannot block the next Telegram button tap.
+    return await asyncio.to_thread(handle_ready_message, data)
