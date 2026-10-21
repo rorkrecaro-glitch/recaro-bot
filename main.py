@@ -5,6 +5,7 @@ import sqlite3
 import secrets
 import logging
 import asyncio
+from html import escape as escape_html
 from contextlib import contextmanager, asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -430,21 +431,41 @@ async def register_pending_report_menu():
         logger.exception("Could not register Telegram /pending menu command")
 
 
-def all_pending_actions(chat_id):
-    """All still-unanswered cases in this chat, including past days.
+def ready_message_link(chat_id, message_id, deal_title, item_number):
+    """Clickable reference to the original bot message in a Telegram supergroup.
 
-    Only 'pending' is untouched. 'unresolved' means someone tried to recheck.
-    Group repeated requests for the same order/item into one list entry.
+    Standard private-group direct links exist for supergroups (-100... IDs).
+    Keep plain text in other chat types rather than creating a broken URL.
     """
+    label = escape_html(f"{deal_title}-{item_number}")
+    try:
+        chat = str(int(chat_id))
+        msg_id = int(message_id)
+    except (ValueError, TypeError):
+        return label
+    if chat.startswith("-100") and msg_id > 0:
+        return f'<a href="https://t.me/c/{chat[4:]}/{msg_id}">{label}</a>'
+    return label
+
+
+def all_pending_actions(chat_id):
+    """All still-unanswered cases, with one actionable message per order/item."""
     with ready_actions_db() as connection:
-        return connection.execute("""
-            SELECT deal_title, item_number, MIN(created_at) AS first_created
+        rows = connection.execute("""
+            SELECT deal_title, item_number, created_at, message_id
               FROM ready_actions
              WHERE chat_id = ? AND status = 'pending'
                AND message_id IS NOT NULL
-             GROUP BY deal_title, item_number
-             ORDER BY first_created, deal_title, item_number
+             ORDER BY created_at, rowid
         """, (chat_id,)).fetchall()
+    results = []
+    seen = set()
+    for deal_title, item_number, first_created, message_id in rows:
+        key = (deal_title, item_number)
+        if key not in seen:
+            seen.add(key)
+            results.append((deal_title, item_number, first_created, message_id))
+    return results
 
 
 def send_all_pending_report(chat_id):
@@ -463,7 +484,7 @@ def send_all_pending_report(chat_id):
     )
     text = header
     pages = []
-    for deal_title, item_number, first_created in rows:
+    for deal_title, item_number, first_created, message_id in rows:
         date = ""
         if first_created:
             try:
@@ -472,7 +493,7 @@ def send_all_pending_report(chat_id):
                 date = created_msk.strftime(" — с %d.%m.%Y")
             except (ValueError, TypeError):
                 pass
-        line = f"• {deal_title}-{item_number}{date}\n"
+        line = f"• {ready_message_link(chat_id, message_id, deal_title, item_number)}{date}\n"
         if len(text) + len(line) > 3700:
             pages.append(text.rstrip())
             text = "🔴 Без реакции (продолжение)\n\n"
@@ -485,6 +506,7 @@ def send_all_pending_report(chat_id):
         telegram_action("sendMessage", {
             "chat_id": chat_id,
             "text": page,
+            "parse_mode": "HTML",
         })
 
 
@@ -500,7 +522,7 @@ def daily_report_data(chat_id, report_date):
     end_utc = end_msk.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with ready_actions_db() as connection:
         rows = connection.execute("""
-            SELECT deal_title, item_number, status
+            SELECT deal_title, item_number, status, message_id
               FROM ready_actions
              WHERE chat_id = ? AND message_id IS NOT NULL
                AND created_at >= ? AND created_at < ?
@@ -531,8 +553,8 @@ def format_daily_report(chat_id, report_date):
             continue
         message += f"\n\n{heading}:"
         displayed = 0
-        for deal_title, item_number, _ in cases:
-            line = f"\n• {deal_title}-{item_number}"
+        for deal_title, item_number, _, message_id in cases:
+            line = f"\n• {ready_message_link(chat_id, message_id, deal_title, item_number)}"
             # Telegram sendMessage has a 4096-character limit.
             if len(message) + len(line) + 75 > 3900:
                 break
@@ -568,6 +590,7 @@ def send_due_reports(now_msk=None):
             telegram_action("sendMessage", {
                 "chat_id": chat_id,
                 "text": format_daily_report(chat_id, day),
+                "parse_mode": "HTML",
             })
             with ready_actions_db() as connection:
                 connection.execute(
