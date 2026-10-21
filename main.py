@@ -18,12 +18,18 @@ REPORT_MINUTE = 30
 async def lifespan(app):
     # The scheduler lives in the existing Amvera app; no outside scheduler is needed.
     task = asyncio.create_task(daily_report_loop())
+    menu_task = asyncio.create_task(register_pending_report_menu())
     try:
         yield
     finally:
         task.cancel()
+        menu_task.cancel()
         try:
             await task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await menu_task
         except asyncio.CancelledError:
             pass
 
@@ -406,6 +412,80 @@ def process_ready_callback(callback):
             logger.exception("Could not release ready callback lock")
 
 
+
+
+async def register_pending_report_menu():
+    """Expose the persistent Telegram Menu button without delaying startup."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        await asyncio.to_thread(
+            telegram_action,
+            "setMyCommands",
+            {"commands": [
+                {"command": "pending", "description": "Все сделки без реакции"},
+            ]},
+        )
+    except Exception:
+        logger.exception("Could not register Telegram /pending menu command")
+
+
+def all_pending_actions(chat_id):
+    """All still-unanswered cases in this chat, including past days.
+
+    Only 'pending' is untouched. 'unresolved' means someone tried to recheck.
+    Group repeated requests for the same order/item into one list entry.
+    """
+    with ready_actions_db() as connection:
+        return connection.execute("""
+            SELECT deal_title, item_number, MIN(created_at) AS first_created
+              FROM ready_actions
+             WHERE chat_id = ? AND status = 'pending'
+               AND message_id IS NOT NULL
+             GROUP BY deal_title, item_number
+             ORDER BY first_created, deal_title, item_number
+        """, (chat_id,)).fetchall()
+
+
+def send_all_pending_report(chat_id):
+    """Send the complete pending list, split into Telegram-sized messages."""
+    rows = all_pending_actions(chat_id)
+    if not rows:
+        telegram_action("sendMessage", {
+            "chat_id": chat_id,
+            "text": "✅ Обращений без реакции нет. Все запросы обработаны.",
+        })
+        return
+
+    header = (
+        "🔴 Обращения без реакции (за всё время)\n"
+        f"Всего изделий: {len(rows)}\n\n"
+    )
+    text = header
+    pages = []
+    for deal_title, item_number, first_created in rows:
+        date = ""
+        if first_created:
+            try:
+                created_utc = datetime.strptime(first_created, "%Y-%m-%d %H:%M:%S")
+                created_msk = created_utc.replace(tzinfo=timezone.utc).astimezone(MSK)
+                date = created_msk.strftime(" — с %d.%m.%Y")
+            except (ValueError, TypeError):
+                pass
+        line = f"• {deal_title}-{item_number}{date}\n"
+        if len(text) + len(line) > 3700:
+            pages.append(text.rstrip())
+            text = "🔴 Без реакции (продолжение)\n\n"
+        text += line
+    pages.append(text.rstrip())
+
+    for i, page in enumerate(pages):
+        if len(pages) > 1:
+            page += f"\n\nСтраница {i + 1}/{len(pages)}"
+        telegram_action("sendMessage", {
+            "chat_id": chat_id,
+            "text": page,
+        })
 
 
 def daily_report_data(chat_id, report_date):
@@ -828,6 +908,22 @@ def handle_ready_message(data):
 
     if not validate_manager(chat_id):
         tg(chat_id, "У Вас нет доступа к этому боту.")
+        return {"ok": True}
+
+    # Telegram command-menu entry: a single tap sends /pending.
+    if text.lower() in ("/pending", "/pending@recaro_ready_bot"):
+        try:
+            send_all_pending_report(chat_id)
+        except Exception:
+            logger.exception("Could not send pending report")
+            tg(chat_id, "❌ Не удалось получить отчёт. Попробуйте ещё раз.")
+        return {"ok": True}
+
+    if text.lower() in ("/start", "/start@recaro_ready_bot"):
+        telegram_action("sendMessage", {
+            "chat_id": chat_id,
+            "text": "Отправьте номер изделия в формате 0001-1.\n\nОтчёт без реакции: /pending",
+        })
         return {"ok": True}
 
     parsed = parse_command(text)
